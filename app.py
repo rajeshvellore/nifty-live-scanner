@@ -40,35 +40,34 @@ def calculate_rsi_manual(series, period=14):
 
 def analyze_stock_live(ticker, days, direction):
     try:
-        # Pull 60 days to ensure RSI is accurate
+        # Pull data
         df = yf.download(ticker, period="60d", interval="1d", progress=False)
         if df.empty or len(df) < 20: return None
 
-        # Clean data (handles MultiIndex if present)
         closes = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
         volumes = df['Volume'].iloc[:, 0] if isinstance(df['Volume'], pd.DataFrame) else df['Volume']
         
-        # Get live data for today
         current_rsi = calculate_rsi_manual(closes).iloc[-1]
         
-        # We need (days + 1) prices to check (days) number of moves
-        # e.g., for 1 day lookback, we need Today and Yesterday to compare.
+        # Pull enough days to check the consecutive moves
+        # For 3 days of moves, we need 4 price points
         recent = closes.tail(days + 1)
         
         # STRICT CONSECUTIVE LOGIC
         if direction == "Falling":
-            # Checks if every day is lower than the previous day, ending with Today
             match = all(recent.iloc[i] < recent.iloc[i-1] for i in range(1, len(recent)))
         else:
-            # Checks if every day is higher than the previous day, ending with Today
             match = all(recent.iloc[i] > recent.iloc[i-1] for i in range(1, len(recent)))
 
         if match:
-            # Calculate today's specific move % (Live vs Yesterday Close)
+            # 1. Today's Move (Current Live Price vs Yesterday's Close)
             today_move = ((recent.iloc[-1] - recent.iloc[-2]) / recent.iloc[-2]) * 100
             
+            # 2. Total Move (Current Live Price vs the Price BEFORE the run started)
+            total_move = ((recent.iloc[-1] - recent.iloc[0]) / recent.iloc[0]) * 100
+            
             if abs(today_move) >= min_change:
-                # Reversal Chance Logic (RSI + Volume)
+                # Reversal Chance Logic
                 score = 0
                 if direction == "Falling" and current_rsi < 30: score += 1
                 elif direction == "Rising" and current_rsi > 70: score += 1
@@ -78,6 +77,7 @@ def analyze_stock_live(ticker, days, direction):
                     "Ticker": ticker.replace(".NS", ""),
                     "LTP": round(float(recent.iloc[-1]), 2),
                     "Today %": round(float(today_move), 2),
+                    "Total %": round(float(total_move), 2),  # New Column
                     "RSI": round(float(current_rsi), 1),
                     "Reversal %": f"{round((score/2)*100)}%",
                     "Vol Status": "High" if volumes.iloc[-1] > volumes.mean() else "Normal"
