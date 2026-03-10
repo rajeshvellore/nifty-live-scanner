@@ -11,7 +11,15 @@ from streamlit_autorefresh import st_autorefresh
 st.set_page_config(page_title="Nifty 50 Pro Agent", layout="wide")
 refresh_count = st_autorefresh(interval=50000, key="niftyscan_refresh")
 
-# --- 2. SMART CLOCK & MARKET DATA ---
+# --- 2. SMART CLOCK (IST) ---
+if os.getenv("STREAMLIT_CLOUD_DASHBOARD") or os.getenv("HOSTNAME"):
+    display_time = datetime.datetime.now() + datetime.timedelta(hours=5, minutes=30)
+    env_label = "Cloud (IST)"
+else:
+    display_time = datetime.datetime.now()
+    env_label = "Local (IST)"
+
+# --- 3. MARKET DATA DASHBOARD ---
 def get_market_summary():
     indexes = {"NIFTY 50": "^NSEI", "BANK NIFTY": "^NSEBANK", "INDIA VIX": "^INDIAVIX"}
     current_data = []
@@ -27,22 +35,22 @@ def get_market_summary():
                 prev_entry = next((item for item in st.session_state.last_market_data if item["name"] == name), None)
                 if prev_entry: current_data.append(prev_entry)
     if current_data: st.session_state.last_market_data = current_data
-    return current_data
+    return st.session_state.last_market_data
 
 index_data = get_market_summary()
 nifty_pct = next((item['pct'] for item in index_data if item['name'] == "NIFTY 50"), 0.01)
 vix_val = next((item['ltp'] for item in index_data if item['name'] == "INDIA VIX"), 15.0)
 
-# Header Dashboard
 st.title("🏹 Nifty 50 Pro Agent")
 idx_cols = st.columns(3)
 for i, item in enumerate(index_data):
     with idx_cols[i]:
         st.metric(label=item['name'], value=f"{item['ltp']:,.2f}", delta=f"{item['pts']:+,.2f} ({item['pct']:.2f}%)")
 
+st.info(f"🕒 **{env_label} Clock:** {display_time.strftime('%H:%M:%S')}")
 st.markdown("---")
 
-# --- 3. SECTOR MAPPING & SIDEBAR ---
+# --- 4. SECTOR MAPPING ---
 sector_map = {
     "ADANIENT": "Metals", "ADANIPORTS": "Services", "APOLLOHOSP": "Healthcare", "ASIANPAINT": "Consumer", "AXISBANK": "Banking",
     "BAJAJ-AUTO": "Auto", "BAJAJFINSV": "Fin Serv", "BAJFINANCE": "Fin Serv", "BEL": "Capital Goods", "BHARTIARTL": "Telecom",
@@ -57,12 +65,7 @@ sector_map = {
 }
 tickers_list = sorted([s + ".NS" for s in sector_map.keys()])
 
-st.sidebar.header("Scan Parameters")
-lookback = st.sidebar.slider("Consecutive Days", 1, 10, 1) 
-trend_dir = st.sidebar.radio("Direction", ["Falling", "Rising"])
-tickers = st.sidebar.multiselect("Stocks", tickers_list, default=tickers_list)
-
-# --- 4. ANALYZER FUNCTION ---
+# --- 5. CORE ANALYZER ---
 def analyze_stock_live(ticker, days, direction, mkt_pct, only_reversals=False):
     try:
         df = yf.download(ticker, period="60d", interval="1d", progress=False, threads=False)
@@ -74,7 +77,7 @@ def analyze_stock_live(ticker, days, direction, mkt_pct, only_reversals=False):
         tr = pd.concat([highs-lows, abs(highs-closes.shift(1)), abs(lows-closes.shift(1))], axis=1).max(axis=1)
         atr_val = tr.rolling(14).mean().iloc[-1]
         rvol = volumes.iloc[-1] / volumes.rolling(20).mean().iloc[-1]
-        exhaust_ratio = (highs.iloc[-1] - lows.iloc[-1]) / atr_val
+        exhaust_ratio = (highs.iloc[-1] - lows.iloc[-1]) / (atr_val if atr_val > 0 else 1)
         
         recent = closes.tail(days + 1)
         match = all(recent.iloc[i] < recent.iloc[i-1] for i in range(1, len(recent))) if direction == "Falling" else all(recent.iloc[i] > recent.iloc[i-1] for i in range(1, len(recent)))
@@ -82,6 +85,7 @@ def analyze_stock_live(ticker, days, direction, mkt_pct, only_reversals=False):
         if match:
             ltp = float(recent.iloc[-1])
             today_move = ((ltp - recent.iloc[-2]) / recent.iloc[-2]) * 100
+            total_trend_move = ((ltp - recent.iloc[0]) / recent.iloc[0]) * 100
             rs_ratio = today_move / mkt_pct if mkt_pct != 0 else 1.0
             
             strike = round((ltp + (1.5*atr_val if direction == "Rising" else -1.5*atr_val))/5)*5
@@ -100,75 +104,92 @@ def analyze_stock_live(ticker, days, direction, mkt_pct, only_reversals=False):
             return {
                 "Ticker": sym, "Sector": sector_map.get(sym, "NA"), "LTP": round(ltp, 2),
                 "Suggestion": "🟢 BUY" if direction == "Falling" else "🔴 SELL",
-                "Buyer Suggestion": "🔥 BUY " + ("CALL" if direction == "Falling" else "PUT") if rvol > 1.5 else "Wait",
-                "Seller Suggestion": "🛡️ SELL " + ("PUT" if direction == "Falling" else "CALL") + f" {strike}",
+                "Buyer Action": ("🔥 BUY " + ("CALL" if direction == "Falling" else "PUT")) if rvol > 1.5 else "Wait",
+                "Seller Action": ("🛡️ SELL " + ("PUT" if direction == "Falling" else "CALL") + f" {strike}"),
                 "Win Rate %": f"{round(win_rate)}%", "Safety Buffer": f"{round(safety_buf, 1)}%",
                 "RSI": round(rsi_val, 1), "RVOL": round(rvol, 2), "RS Ratio": round(rs_ratio, 2),
                 "Exhaustion %": f"{round(exhaust_ratio*100)}%", "Today %": round(today_move, 2),
+                "Total %": round(total_trend_move, 2),
                 "Reasoning": " + ".join(reasons) if reasons else "Trend Strength",
                 "Chart": f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
             }
     except: return None
 
-# --- 5. FIXED ACTION BUTTONS & TIMESTAMP ---
+# --- 6. FIXED BUTTONS ---
+st.sidebar.header("Scan Parameters")
+look_val = st.sidebar.slider("Consecutive Days", 1, 10, 1) 
+t_dir = st.sidebar.radio("Direction", ["Falling", "Rising"])
+sel_tickers = st.sidebar.multiselect("Stocks", tickers_list, default=tickers_list)
+
 if 'last_scan_time' not in st.session_state: st.session_state.last_scan_time = "Never"
 
-col_btn1, col_btn2, col_time = st.columns([1, 1, 2])
-with col_btn1:
+c_btn1, c_btn2, c_time = st.columns([1, 1, 2])
+with c_btn1:
     if st.button("🚀 Execute Global Scan", key="main_scan"):
-        with st.spinner("Scanning..."):
-            results = [analyze_stock_live(t, lookback, trend_dir, nifty_pct) for t in tickers]
-            st.session_state.scan_results = [r for r in results if r]
+        with st.spinner("Analyzing..."):
+            res = [analyze_stock_live(t, look_val, t_dir, nifty_pct) for t in sel_tickers]
+            st.session_state.scan_results = [r for r in res if r]
             st.session_state.last_scan_time = datetime.datetime.now().strftime("%H:%M:%S")
-with col_btn2:
+with c_btn2:
     if st.button("🎯 Reversals Only", key="rev_scan"):
         with st.spinner("Filtering..."):
-            results = [analyze_stock_live(t, lookback, trend_dir, nifty_pct, True) for t in tickers]
-            st.session_state.scan_results = [r for r in results if r]
+            res = [analyze_stock_live(t, look_val, t_dir, nifty_pct, True) for t in sel_tickers]
+            st.session_state.scan_results = [r for r in res if r]
             st.session_state.last_scan_time = datetime.datetime.now().strftime("%H:%M:%S")
-with col_time:
-    st.info(f"**Last Scanned At:** {st.session_state.last_scan_time}")
+# with c_time:
+#     st.info(f"**Last Scanned At:** {st.session_state.last_scan_time}")
 
-# --- 6. TABS LAYOUT ---
-tab_trend, tab_buy, tab_sell, tab_ath_atl = st.tabs(["🏹 Trend Scanner", "⚡ Option Buying", "🛡️ Option Selling", "🏔️ ATH / ATL"])
+# --- 7. TABS LAYOUT ---
+tab_morning, tab_trend, tab_buy, tab_sell, tab_ath_atl = st.tabs(["🔥 Morning Momentum", "🏹 Trend Scanner", "⚡ Option Buying", "🛡️ Option Selling", "🏔️ ATH / ATL"])
+
+with tab_morning:
+    st.subheader("☀️ Open = High / Open = Low Scanner")
+    
+    if st.button("🔎 Scan Morning Edge", key="morn_btn"):
+        morn_res = []
+        with st.spinner("Checking Intraday Openings..."):
+            for t in sel_tickers:
+                try:
+                    m_df = yf.download(t, period="1d", interval="1m", progress=False)
+                    if m_df.empty: continue
+                    op, hi, lo, cp = m_df['Open'].iloc[0], m_df['High'].max(), m_df['Low'].min(), m_df['Close'].iloc[-1]
+                    # Buffer of 0.05% for "Equal"
+                    if abs(op - lo) / op < 0.0005: 
+                        morn_res.append({"Ticker": t.replace(".NS",""), "Type": "🟢 Open = Low (Bullish)", "LTP": round(float(cp),2), "Day %": round(((cp-op)/op)*100,2)})
+                    elif abs(op - hi) / op < 0.0005:
+                        morn_res.append({"Ticker": t.replace(".NS",""), "Type": "🔴 Open = High (Bearish)", "LTP": round(float(cp),2), "Day %": round(((cp-op)/op)*100,2)})
+                except: continue
+        if morn_res: st.dataframe(pd.DataFrame(morn_res).sort_values(by="Day %", ascending=False))
+        else: st.info("No stocks currently showing perfect Open=High or Open=Low matches.")
 
 if 'scan_results' in st.session_state and st.session_state.scan_results:
     df = pd.DataFrame(st.session_state.scan_results)
-    
     with tab_trend:
-        st.dataframe(df[["Ticker", "Sector", "Suggestion", "LTP", "Today %", "RSI", "Reasoning"]])
-        st.subheader("🔗 Chart Links")
+        st.dataframe(df[["Ticker", "Sector", "Suggestion", "LTP", "Today %", "Total %", "RSI", "Reasoning"]])
         l_cols = st.columns(5)
         for i, row in enumerate(st.session_state.scan_results):
             with l_cols[i % 5]: st.markdown(f"**[{row['Ticker']}]({row['Chart']})**")
-            
     with tab_buy:
-        st.subheader("⚡ Momentum: RVOL + RS Ratio Focus")
-        
-        st.dataframe(df[["Ticker", "Buyer Suggestion", "RS Ratio", "RVOL", "RSI", "Today %"]].sort_values(by="RS Ratio", ascending=False))
-        
+        st.dataframe(df[["Ticker", "Buyer Action", "RS Ratio", "RVOL", "RSI", "Today %"]].sort_values(by="RS Ratio", ascending=False))
     with tab_sell:
-        st.subheader("🛡️ Safety: Win Rate + Buffer Focus")
-        
-        st.dataframe(df[["Ticker", "Seller Suggestion", "Win Rate %", "Safety Buffer", "Exhaustion %", "LTP"]].sort_values(by="Win Rate %", ascending=False))
+        st.dataframe(df[["Ticker", "Seller Action", "Win Rate %", "Safety Buffer", "Exhaustion %", "LTP"]].sort_values(by="Win Rate %", ascending=False))
 
 with tab_ath_atl:
-    st.subheader("Historical Extreme Tracker")
-    if st.button("🏔️ Scan ATH / ATL Records", key="ath_btn"):
-        ath_data = []
-        with st.spinner("Fetching All-Time Data..."):
-            for t in tickers:
+    st.subheader("🏔️ All-Time High / Low Tracker")
+    if st.button("🔥 Scan Historical Records", key="ath_btn"):
+        ath_res = []
+        with st.spinner("Fetching Max History..."):
+            for t in sel_tickers:
                 try:
                     h_df = yf.download(t, period="max", interval="1d", progress=False)
                     hi, lo, cp = h_df['High'].max(), h_df['Low'].min(), h_df['Close'].iloc[-1]
-                    if ((hi - cp)/hi)*100 < 1.2: ath_data.append({"Ticker": t, "Type": "ATH Breakout", "Price": round(float(hi),2)})
-                    if ((cp - lo)/lo)*100 < 1.2: ath_data.append({"Ticker": t, "Type": "ATL Breakdown", "Price": round(float(lo),2)})
+                    if ((hi - cp)/hi)*100 < 1.2: ath_res.append({"Ticker": t.replace(".NS",""), "Type": "🏔️ ATH", "Price": round(float(hi),2), "Dist %": round(((hi-cp)/hi)*100,2)})
+                    if ((cp - lo)/lo)*100 < 1.2: ath_res.append({"Ticker": t.replace(".NS",""), "Type": "🕳️ ATL", "Price": round(float(lo),2), "Dist %": round(((cp-lo)/lo)*100,2)})
                 except: continue
-        if ath_data: st.dataframe(pd.DataFrame(ath_data))
-        else: st.info("No stocks near ATH/ATL currently.")
+        if ath_res: st.dataframe(pd.DataFrame(ath_res))
+        else: st.info("No stocks near ATH or ATL levels.")
 
-# --- 7. EXPORT ---
 if 'scan_results' in st.session_state:
     st.markdown("---")
-    csv = pd.DataFrame(st.session_state.scan_results).to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Download Data", csv, "nifty_report.csv", "text/csv")
+    csv_data = pd.DataFrame(st.session_state.scan_results).to_csv(index=False).encode('utf-8')
+    st.download_button("📥 Download Full Report", csv_data, "nifty_pro_report.csv", "text/csv")
